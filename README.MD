@@ -132,3 +132,5 @@ user:{user_id}:score - счет пользователя
 
 
 
+https://vk.com/club235863846
+@viktorina5683_bot

@@ -1,125 +1,138 @@
+import os
+import redis
 import random
+import logging
+import time
+from dotenv import load_dotenv
 from telegram.ext import Updater, CommandHandler, MessageHandler, Filters, ConversationHandler
 from telegram import ReplyKeyboardMarkup
 from common import *
 
-
-log_info("Starting Telegram bot...")
-all_quiz_questions = load_all_quiz_questions()
-
-
 START, WAITING_FOR_ANSWER = range(2)
 
-keyboard = ReplyKeyboardMarkup([['Новый вопрос', 'Сдаться'], ['Мой счёт']], resize_keyboard=True)
+
+def init_redis():
+    client = redis.Redis(
+        host=os.getenv('REDIS_HOST'),
+        port=int(os.getenv('REDIS_PORT', 18571)),
+        password=os.getenv('REDIS_PASSWORD'),
+        decode_responses=True,
+        socket_connect_timeout=3,
+        socket_timeout=3
+    )
+    client.ping()
+    return client
 
 
-def handle_start(update, context):
+def create_keyboard():
+    return ReplyKeyboardMarkup(
+        [['Новый вопрос', 'Сдаться'], ['Мой счёт']],
+        resize_keyboard=True
+    )
+
+
+def handle_start(update, context, redis_client, keyboard):
     user = update.message.from_user
-    if get_user_score(user.id) == 0:
-        save_user_score(user.id, 0)
-
-    log_event(user.id, f"start - {user.first_name}")
+    logging.info(f"Start: {user.id} {user.first_name}")
     update.message.reply_text(f'Привет, {user.first_name}!', reply_markup=keyboard)
     return START
 
 
-def handle_new_question(update, context):
+def handle_new_question(update, context, redis_client, keyboard, all_quiz_questions):
     user = update.message.from_user
-
-    if not all_quiz_questions:
-        update.message.reply_text('Вопросы не загружены')
-        return START
-
     question_number = random.choice(list(all_quiz_questions.keys()))
-    question_text, correct_answer = all_quiz_questions[question_number]
-
-    save_user_question(user.id, question_number)
-    log_event(user.id, "new question")
-
+    question_text, _ = all_quiz_questions[question_number]
+    save_user_question(user.id, question_number, redis_client, platform='tg')
+    logging.info(f"New question: {user.id} -> {question_number}")
     update.message.reply_text(f'❓ Вопрос:\n{question_text}', reply_markup=keyboard)
     return WAITING_FOR_ANSWER
 
 
-def handle_answer(update, context):
+def handle_answer(update, context, redis_client, keyboard, all_quiz_questions):
     user = update.message.from_user
-    user_answer = update.message.text
-
-    question_number = get_user_question(user.id)
-    if not question_number:
-        update.message.reply_text('Сначала получите вопрос!', reply_markup=keyboard)
-        return START
-
+    question_number = get_user_question(user.id, redis_client, platform='tg')
     _, correct_answer = all_quiz_questions[question_number]
 
-    if user_answer.lower().strip() == correct_answer.lower().strip():
-        current_score = get_user_score(user.id)
-        new_score = current_score + 1
-        save_user_score(user.id, new_score)
-        clear_user_question(user.id)
-
-        log_event(user.id, f"correct answer - score: {new_score}")
-        update.message.reply_text(f'Правильно! Счёт: {new_score}', reply_markup=keyboard)
+    if update.message.text.lower().strip() == correct_answer.lower().strip():
+        current_score = get_user_score(user.id, redis_client, platform='tg') + 1
+        save_user_score(user.id, current_score, redis_client, platform='tg')
+        clear_user_question(user.id, redis_client, platform='tg')
+        logging.info(f"Correct: {user.id} score:{current_score}")
+        update.message.reply_text(f'Правильно! Счёт: {current_score}', reply_markup=keyboard)
         return START
     else:
-        log_event(user.id, f"wrong answer: {user_answer[:50]}...")
-        update.message.reply_text(' Неправильно', reply_markup=keyboard)
+        logging.info(f"Wrong: {user.id}")
+        update.message.reply_text('❌ Неправильно', reply_markup=keyboard)
         return WAITING_FOR_ANSWER
 
 
-def handle_surrender(update, context):
+def handle_surrender(update, context, redis_client, keyboard, all_quiz_questions):
     user = update.message.from_user
-
-    question_number = get_user_question(user.id)
-    if not question_number:
-        update.message.reply_text('Нет активного вопроса', reply_markup=keyboard)
-        return START
-
+    question_number = get_user_question(user.id, redis_client, platform='tg')
     _, correct_answer = all_quiz_questions[question_number]
-    clear_user_question(user.id)
-
-    log_event(user.id, "surrendered")
-    update.message.reply_text(f' Ответ: {correct_answer}', reply_markup=keyboard)
+    clear_user_question(user.id, redis_client, platform='tg')
+    logging.info(f"Surrender: {user.id}")
+    update.message.reply_text(f'📖 Ответ: {correct_answer}', reply_markup=keyboard)
     return START
 
 
-def handle_score(update, context):
+def handle_score(update, context, redis_client, keyboard):
     user = update.message.from_user
-    score = get_user_score(user.id)
-
-    log_event(user.id, f"check score: {score}")
-    update.message.reply_text(f'🏆 Счёт: {score}', reply_markup=keyboard)
-    return None
+    current_score = get_user_score(user.id, redis_client, platform='tg')
+    logging.info(f"Score check: {user.id} -> {current_score}")
+    update.message.reply_text(f'🏆 Счёт: {current_score}', reply_markup=keyboard)
 
 
 def main():
-    try:
-        updater = Updater(TELEGRAM_BOT_TOKEN, use_context=True)
-        dispatcher = updater.dispatcher
+    logging.basicConfig(level=logging.INFO, format='[%(levelname)s] %(message)s')
+    load_dotenv()
 
-        conv_handler = ConversationHandler(
-            entry_points=[
-                MessageHandler(Filters.text & ~Filters.command, handle_start),
-                CommandHandler('start', handle_start)
+    questions_path = get_questions_path()
+    redis_client = init_redis()
+    all_quiz_questions = load_all_quiz_questions(questions_path)
+    logging.info(f"Loaded {len(all_quiz_questions)} questions")
+
+    telegram_bot_token = os.getenv('TELEGRAM_BOT_TOKEN')
+    keyboard = create_keyboard()
+
+    def start_handler(update, context):
+        return handle_start(update, context, redis_client, keyboard)
+
+    def new_question_handler(update, context):
+        return handle_new_question(update, context, redis_client, keyboard, all_quiz_questions)
+
+    def answer_handler(update, context):
+        return handle_answer(update, context, redis_client, keyboard, all_quiz_questions)
+
+    def surrender_handler(update, context):
+        return handle_surrender(update, context, redis_client, keyboard, all_quiz_questions)
+
+    def score_handler(update, context):
+        return handle_score(update, context, redis_client, keyboard)
+
+    updater = Updater(telegram_bot_token, use_context=True)
+    conversation_handler = ConversationHandler(
+        entry_points=[
+            CommandHandler('start', start_handler),
+            MessageHandler(Filters.text, start_handler)
+        ],
+        states={
+            START: [
+                MessageHandler(Filters.regex('Новый вопрос'), new_question_handler),
+                MessageHandler(Filters.regex('Мой счёт'), score_handler),
             ],
-            states={
-                START: [
-                    MessageHandler(Filters.regex('Новый вопрос'), handle_new_question),
-                    MessageHandler(Filters.regex('Мой счёт'), handle_score),
-                ],
-                WAITING_FOR_ANSWER: [
-                    MessageHandler(Filters.regex('Сдаться'), handle_surrender),
-                    MessageHandler(Filters.text & ~Filters.command, handle_answer),
-                ],
-            },
-            fallbacks=[CommandHandler('cancel', handle_start)],
-        )
+            WAITING_FOR_ANSWER: [
+                MessageHandler(Filters.regex('Сдаться'), surrender_handler),
+                MessageHandler(Filters.text, answer_handler),
+            ],
+        },
+        fallbacks=[CommandHandler('start', start_handler)],
+    )
 
-        dispatcher.add_handler(conv_handler)
-        log_info("Telegram bot started")
-        updater.start_polling()
-        updater.idle()
-    except Exception as e:
-        log_error(f"Telegram bot fatal error: {e}")
+    updater.dispatcher.add_handler(conversation_handler)
+    logging.info("Telegram bot started")
+    updater.start_polling()
+    updater.idle()
 
 
 if __name__ == '__main__':

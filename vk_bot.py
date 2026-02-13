@@ -1,14 +1,29 @@
+import os
+import redis
 import random
+import logging
+import time
+from dotenv import load_dotenv
 import vk_api
 from vk_api.longpoll import VkLongPoll, VkEventType
 from vk_api.keyboard import VkKeyboard, VkKeyboardColor
 from vk_api.utils import get_random_id
 from common import *
 
+WAITING_STATE = 'WAITING'
 
-log_info("Starting VK bot...")
-all_quiz_questions = load_all_quiz_questions()
-user_states = {}
+
+def init_redis():
+    client = redis.Redis(
+        host=os.getenv('REDIS_HOST'),
+        port=int(os.getenv('REDIS_PORT', 18571)),
+        password=os.getenv('REDIS_PASSWORD'),
+        decode_responses=True,
+        socket_connect_timeout = 3,
+        socket_timeout = 3
+    )
+    client.ping()
+    return client
 
 
 def create_keyboard():
@@ -20,144 +35,113 @@ def create_keyboard():
     return keyboard
 
 
-def handle_start(user_id, api, vk):
-    user_info = api.users.get(user_ids=user_id)[0]
-    user_states[user_id] = 'START'
-    log_event(user_id, f"start - {user_info['first_name']}")
-
+def handle_start(user_id, vk, keyboard):
     vk.messages.send(
         user_id=user_id,
         random_id=get_random_id(),
-        keyboard=create_keyboard().get_keyboard(),
-        message=f'Привет, {user_info["first_name"]}! Выберите действие:'
+        keyboard=keyboard.get_keyboard(),
+        message='Привет! Выберите действие:'
     )
 
 
-def handle_new_question(user_id, api, vk):
-    if not all_quiz_questions:
-        vk.messages.send(user_id=user_id, random_id=get_random_id(), message='Вопросы не загружены')
-        return
-
+def handle_new_question(user_id, vk, keyboard, redis_client, all_quiz_questions, user_states):
     question_number = random.choice(list(all_quiz_questions.keys()))
-    question_text, correct_answer = all_quiz_questions[question_number]
-
-    save_user_question(user_id, question_number)
-    user_states[user_id] = 'WAITING_FOR_ANSWER'
-    log_event(user_id, "new question")
+    question_text, _ = all_quiz_questions[question_number]
+    save_user_question(user_id, question_number, redis_client, platform='vk')
+    user_states[user_id] = WAITING_STATE
 
     vk.messages.send(
         user_id=user_id,
         random_id=get_random_id(),
-        keyboard=create_keyboard().get_keyboard(),
-        message=f'❓ Вопрос:\n{question_text}\n\nНапишите ответ:'
+        keyboard=keyboard.get_keyboard(),
+        message=f'❓ Вопрос:\n{question_text}'
     )
 
 
-def handle_answer(user_id, answer, api, vk):
-    question_number = get_user_question(user_id)
-    if not question_number:
-        vk.messages.send(user_id=user_id, random_id=get_random_id(), message='Сначала получите вопрос!')
-        return
-
+def handle_answer(user_id, answer, vk, keyboard, redis_client, all_quiz_questions, user_states):
+    question_number = get_user_question(user_id, redis_client, platform='vk')
     _, correct_answer = all_quiz_questions[question_number]
 
     if answer.lower().strip() == correct_answer.lower().strip():
-        current_score = get_user_score(user_id)
-        new_score = current_score + 1
-        save_user_score(user_id, new_score)
-        clear_user_question(user_id)
+        current_score = get_user_score(user_id, redis_client, platform='vk') + 1
+        save_user_score(user_id, current_score, redis_client, platform='vk')
+        clear_user_question(user_id, redis_client, platform='vk')  # ← vk префикс
         user_states[user_id] = 'START'
 
-        log_event(user_id, f"correct answer - score: {new_score}")
         vk.messages.send(
             user_id=user_id,
             random_id=get_random_id(),
-            keyboard=create_keyboard().get_keyboard(),
-            message=f'✅ Правильно! Счёт: {new_score}'
+            keyboard=keyboard.get_keyboard(),
+            message=f'✅ Правильно! Счёт: {current_score}'
         )
     else:
-        log_event(user_id, f"wrong answer: {answer[:50]}...")
         vk.messages.send(
             user_id=user_id,
             random_id=get_random_id(),
-            keyboard=create_keyboard().get_keyboard(),
+            keyboard=keyboard.get_keyboard(),
             message='❌ Неправильно'
         )
 
 
-def handle_surrender(user_id, api, vk):
-    question_number = get_user_question(user_id)
-    if not question_number:
-        vk.messages.send(user_id=user_id, random_id=get_random_id(), message='Нет активного вопроса')
-        return
-
+def handle_surrender(user_id, vk, keyboard, redis_client, all_quiz_questions, user_states):
+    question_number = get_user_question(user_id, redis_client, platform='vk')  # ← vk префикс
     _, correct_answer = all_quiz_questions[question_number]
-    clear_user_question(user_id)
+
+    clear_user_question(user_id, redis_client, platform='vk')
     user_states[user_id] = 'START'
 
-    log_event(user_id, "surrendered")
     vk.messages.send(
         user_id=user_id,
         random_id=get_random_id(),
-        keyboard=create_keyboard().get_keyboard(),
+        keyboard=keyboard.get_keyboard(),
         message=f'📖 Ответ: {correct_answer}'
     )
 
 
-def handle_score(user_id, api, vk):
-    score = get_user_score(user_id)
-    log_event(user_id, f"check score: {score}")
+def handle_score(user_id, vk, keyboard, redis_client):
+    current_score = get_user_score(user_id, redis_client, platform='vk')
     vk.messages.send(
         user_id=user_id,
         random_id=get_random_id(),
-        keyboard=create_keyboard().get_keyboard(),
-        message=f'🏆 Счёт: {score}'
+        keyboard=keyboard.get_keyboard(),
+        message=f'🏆 Счёт: {current_score}'
     )
 
 
-def process_message(event, api, vk):
-    user_id = event.user_id
-    text = event.text.strip()
-    state = user_states.get(user_id, 'START')
-
-    log_event(user_id, f"message: {text} (state: {state})")
-
-    if text == 'Новый вопрос':
-        handle_new_question(user_id, api, vk)
-    elif text == 'Сдаться':
-        handle_surrender(user_id, api, vk)
-    elif text == 'Мой счёт':
-        handle_score(user_id, api, vk)
-    elif state == 'WAITING_FOR_ANSWER':
-        handle_answer(user_id, text, api, vk)
-    else:
-        handle_start(user_id, api, vk)
-
-
 def main():
-    try:
-        session = vk_api.VkApi(token=VK_BOT_TOKEN)
-        api = session.get_api()
-        longpoll = VkLongPoll(session)
+    logging.basicConfig(level=logging.INFO, format='[%(levelname)s] %(message)s')
+    load_dotenv()
 
-        log_info("VK bot started, listening...")
+    questions_path = get_questions_path()
+    redis_client = init_redis()
+    logging.info("Redis connected")
+    all_quiz_questions = load_all_quiz_questions(questions_path)
+    logging.info(f"Loaded {len(all_quiz_questions)} questions")
+    vk_bot_token = os.getenv('VK_BOT_TOKEN')
+    keyboard = create_keyboard()
+    user_states = {}
+    session = vk_api.VkApi(token=vk_bot_token)
+    vk = session.get_api()
+    longpoll = VkLongPoll(session)
 
-        for event in longpoll.listen():
-            if event.type == VkEventType.MESSAGE_NEW and event.to_me:
-                try:
-                    process_message(event, api, api)
-                except Exception as e:
-                    log_error(f"Processing error: {e}")
-                    try:
-                        api.messages.send(
-                            user_id=event.user_id,
-                            random_id=get_random_id(),
-                            message='Ошибка обработки'
-                        )
-                    except:
-                        pass
-    except Exception as e:
-        log_error(f"VK bot fatal error: {e}")
+    logging.info("VK bot started")
+
+    for event in longpoll.listen():
+        if event.type == VkEventType.MESSAGE_NEW and event.to_me:
+            user_id = event.user_id
+            text = event.text.strip()
+            state = user_states.get(user_id, 'START')
+
+            if text == 'Новый вопрос':
+                handle_new_question(user_id, vk, keyboard, redis_client, all_quiz_questions, user_states)
+            elif text == 'Сдаться':
+                handle_surrender(user_id, vk, keyboard, redis_client, all_quiz_questions, user_states)
+            elif text == 'Мой счёт':
+                handle_score(user_id, vk, keyboard, redis_client)
+            elif state == WAITING_STATE:
+                handle_answer(user_id, text, vk, keyboard, redis_client, all_quiz_questions, user_states)
+            else:
+                handle_start(user_id, vk, keyboard)
 
 
 if __name__ == '__main__':

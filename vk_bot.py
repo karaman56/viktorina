@@ -8,22 +8,9 @@ import vk_api
 from vk_api.longpoll import VkLongPoll, VkEventType
 from vk_api.keyboard import VkKeyboard, VkKeyboardColor
 from vk_api.utils import get_random_id
-from common import *
+from common import *  # ← теперь импортирует init_redis_client
 
 WAITING_STATE = 'WAITING'
-
-
-def init_redis():
-    client = redis.Redis(
-        host=os.getenv('REDIS_HOST'),
-        port=int(os.getenv('REDIS_PORT', 18571)),
-        password=os.getenv('REDIS_PASSWORD'),
-        decode_responses=True,
-        socket_connect_timeout = 3,
-        socket_timeout = 3
-    )
-    client.ping()
-    return client
 
 
 def create_keyboard():
@@ -49,7 +36,6 @@ def handle_new_question(user_id, vk, keyboard, redis_client, all_quiz_questions,
     question_text, _ = all_quiz_questions[question_number]
     save_user_question(user_id, question_number, redis_client, platform='vk')
     user_states[user_id] = WAITING_STATE
-
     vk.messages.send(
         user_id=user_id,
         random_id=get_random_id(),
@@ -61,13 +47,11 @@ def handle_new_question(user_id, vk, keyboard, redis_client, all_quiz_questions,
 def handle_answer(user_id, answer, vk, keyboard, redis_client, all_quiz_questions, user_states):
     question_number = get_user_question(user_id, redis_client, platform='vk')
     _, correct_answer = all_quiz_questions[question_number]
-
     if answer.lower().strip() == correct_answer.lower().strip():
         current_score = get_user_score(user_id, redis_client, platform='vk') + 1
         save_user_score(user_id, current_score, redis_client, platform='vk')
-        clear_user_question(user_id, redis_client, platform='vk')  # ← vk префикс
+        clear_user_question(user_id, redis_client, platform='vk')
         user_states[user_id] = 'START'
-
         vk.messages.send(
             user_id=user_id,
             random_id=get_random_id(),
@@ -84,7 +68,7 @@ def handle_answer(user_id, answer, vk, keyboard, redis_client, all_quiz_question
 
 
 def handle_surrender(user_id, vk, keyboard, redis_client, all_quiz_questions, user_states):
-    question_number = get_user_question(user_id, redis_client, platform='vk')  # ← vk префикс
+    question_number = get_user_question(user_id, redis_client, platform='vk')
     _, correct_answer = all_quiz_questions[question_number]
 
     clear_user_question(user_id, redis_client, platform='vk')
@@ -112,12 +96,16 @@ def main():
     logging.basicConfig(level=logging.INFO, format='[%(levelname)s] %(message)s')
     load_dotenv()
 
-    questions_path = get_questions_path()
-    redis_client = init_redis()
+    questions_path = os.getenv('QUIZ_QUESTIONS_PATH', 'quiz-questions')
+    redis_host = os.getenv('REDIS_HOST')
+    redis_port = int(os.getenv('REDIS_PORT', 18571))
+    redis_password = os.getenv('REDIS_PASSWORD')
+    vk_bot_token = os.getenv('VK_BOT_TOKEN')
+    redis_client = init_redis_client(redis_host, redis_port, redis_password)
     logging.info("Redis connected")
     all_quiz_questions = load_all_quiz_questions(questions_path)
     logging.info(f"Loaded {len(all_quiz_questions)} questions")
-    vk_bot_token = os.getenv('VK_BOT_TOKEN')
+
     keyboard = create_keyboard()
     user_states = {}
     session = vk_api.VkApi(token=vk_bot_token)

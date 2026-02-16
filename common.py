@@ -3,8 +3,17 @@ import redis
 from dotenv import load_dotenv
 
 
-def get_questions_path():
-    return os.getenv('QUIZ_QUESTIONS_PATH', 'quiz-questions')
+def init_redis_client(redis_host, redis_port, redis_password):
+    client = redis.Redis(
+        host=redis_host,
+        port=redis_port,
+        password=redis_password,
+        decode_responses=True,
+        socket_connect_timeout=3,
+        socket_timeout=3
+    )
+    client.ping()
+    return client
 
 
 def save_user_question(user_id, question_number, redis_client, platform='tg'):
@@ -73,17 +82,15 @@ def load_all_quiz_questions(questions_path):
 
 def main():
     load_dotenv()
-    quiz_questions_path = get_questions_path()
+    quiz_questions_path = os.getenv('QUIZ_QUESTIONS_PATH', 'quiz-questions')
     redis_client = None
     if os.getenv('REDIS_HOST'):
         try:
-            redis_client = redis.Redis(
-                host=os.getenv('REDIS_HOST'),
-                port=int(os.getenv('REDIS_PORT', 18571)),
-                password=os.getenv('REDIS_PASSWORD'),
-                decode_responses=True
+            redis_client = init_redis_client(
+                os.getenv('REDIS_HOST'),
+                int(os.getenv('REDIS_PORT', 18571)),
+                os.getenv('REDIS_PASSWORD')
             )
-            redis_client.ping()
             print("✅ Redis connected")
         except redis.ConnectionError:
             print("❌ Redis connection failed")

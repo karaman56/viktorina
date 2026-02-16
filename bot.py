@@ -11,19 +11,6 @@ from common import *
 START, WAITING_FOR_ANSWER = range(2)
 
 
-def init_redis():
-    client = redis.Redis(
-        host=os.getenv('REDIS_HOST'),
-        port=int(os.getenv('REDIS_PORT', 18571)),
-        password=os.getenv('REDIS_PASSWORD'),
-        decode_responses=True,
-        socket_connect_timeout=3,
-        socket_timeout=3
-    )
-    client.ping()
-    return client
-
-
 def create_keyboard():
     return ReplyKeyboardMarkup(
         [['Новый вопрос', 'Сдаться'], ['Мой счёт']],
@@ -87,12 +74,16 @@ def main():
     logging.basicConfig(level=logging.INFO, format='[%(levelname)s] %(message)s')
     load_dotenv()
 
-    questions_path = get_questions_path()
-    redis_client = init_redis()
+    questions_path = os.getenv('QUIZ_QUESTIONS_PATH', 'quiz-questions')
+    redis_host = os.getenv('REDIS_HOST')
+    redis_port = int(os.getenv('REDIS_PORT', 18571))
+    redis_password = os.getenv('REDIS_PASSWORD')
+    telegram_bot_token = os.getenv('TELEGRAM_BOT_TOKEN')
+
+    redis_client = init_redis_client(redis_host, redis_port, redis_password)
     all_quiz_questions = load_all_quiz_questions(questions_path)
     logging.info(f"Loaded {len(all_quiz_questions)} questions")
 
-    telegram_bot_token = os.getenv('TELEGRAM_BOT_TOKEN')
     keyboard = create_keyboard()
 
     def start_handler(update, context):
